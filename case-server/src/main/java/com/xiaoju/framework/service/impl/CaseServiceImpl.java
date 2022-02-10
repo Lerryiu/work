@@ -101,14 +101,19 @@ public class CaseServiceImpl implements CaseService {
         Date endTime = transferTime(request.getEndTime());
         PageHelper.startPage(request.getPageNum(), request.getPageSize());
         // select * from test_case where case_id in (request.getCaseIds()) [and ...any other condition];
+
+
+
         List<TestCase> caseList = caseMapper.search(request.getCaseType(), caseIds, request.getTitle(), request.getCreator(),
                 request.getRequirementId(), beginTime, endTime, request.getChannel(), request.getLineId(), request.getCaseKeyWords());
+
         List<RecordNumDto> recordNumDtos = recordMapper.getRecordNumByCaseIds(caseIds);
         Map<Long, Integer> recordMap = recordNumDtos.stream().collect(Collectors.toMap(RecordNumDto::getCaseId, RecordNumDto::getRecordNum));
 
         for (TestCase testCase : caseList) {
             res.add(buildListResp(testCase, recordMap.get(testCase.getId())));
         }
+
         return PageModule.buildPage(res, ((Page<TestCase>) caseList).getTotal());
     }
 
@@ -300,6 +305,7 @@ public class CaseServiceImpl implements CaseService {
             caseBackup.setCaseContent("");
         } else {
             // 这里触发保存testcase
+
             synchronized (WebSocket.getRoomLock()) {
                 TestCase testCase = caseMapper.selectOne(req.getId());
 //                String caseContent = testCase.getCaseContent();
@@ -352,10 +358,12 @@ public class CaseServiceImpl implements CaseService {
                     LOGGER.error("http应该保存的用例内容是：" + req.getCaseContent());
                 }
 
+
             }
             caseBackup.setCaseId(req.getId());
             caseBackup.setCaseContent(req.getCaseContent());
             caseBackup.setRecordContent("");
+
         }
         caseBackup.setCreator(req.getModifier());
         caseBackup.setExtra("");
