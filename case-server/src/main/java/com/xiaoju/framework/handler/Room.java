@@ -7,11 +7,14 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.flipkart.zjsonpatch.JsonDiff;
 import com.flipkart.zjsonpatch.JsonPatch;
+import com.xiaoju.framework.entity.persistent.CaseBackup;
 import com.xiaoju.framework.entity.persistent.TestCase;
 import com.xiaoju.framework.mapper.TestCaseMapper;
 import com.xiaoju.framework.service.CaseBackupService;
 import com.xiaoju.framework.service.RecordService;
 import com.xiaoju.framework.util.BitBaseUtil;
+
+
 import org.apache.poi.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,7 +22,6 @@ import org.springframework.util.StringUtils;
 
 import javax.websocket.Session;
 import java.util.*;
-import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -42,13 +44,17 @@ public abstract class Room {
     private static final int TIMER_DELAY = 30;
     private TimerTask activeBroadcastTimerTask;
 
-    private static final int MAX_PLAYER_COUNT = 100;
+    public static Boolean editInfoSaveToDB = true; // true:编辑信息保存到数据库; false:编辑信息保存到日志
+    public static Long roomId;
+    private static final int MAX_PLAYER_COUNT = 10;
     public final List<Player> players = new ArrayList<>();
 
     public final List<String> undoDiffs = new LinkedList<>();
     public final List<String> redoDiffs = new LinkedList<>();
     private Integer undoPosition;
     private Integer redoPosition;
+
+    protected Integer lastUndoCounts;
 
     public final Map<Session, Client> cs = new ConcurrentHashMap<>();
 
@@ -81,6 +87,7 @@ public abstract class Room {
     }
     // id 前面部分是case id；后面部分是record id
     public Room(Long id) {
+        this.roomId = id;
         long caseId = BitBaseUtil.getLow32(id);
         if (testCase != null) {
             return;
@@ -92,6 +99,7 @@ public abstract class Room {
         }
         undoPosition = undoDiffs.size();
         redoPosition = redoDiffs.size();
+        lastUndoCounts = 0;
     }
 
     private TimerTask createBroadcastTimerTask() {
@@ -112,6 +120,10 @@ public abstract class Room {
         return testCaseContent;
     }
 
+    public void setTestCaseContent(String content) {
+        testCaseContent = content;
+    }
+
     public Player createAndAddPlayer(Client client) {
         if (players.size() >= MAX_PLAYER_COUNT) {
             throw new IllegalStateException("Maximum player count ("
@@ -121,7 +133,7 @@ public abstract class Room {
         Player p = new Player(this, client);
 
         // 通知消息
-        broadcastRoomMessage(CaseMessageType.NOTIFY, "当前用户数： " + (players.size() + 1) + "。新用户是：" + client.getClientName());
+//        broadcastRoomMessage(CaseMessageType.NOTIFY, "当前用户数:" + (players.size() + 1) + ",用户是:" + client.getClientName());
 
         players.add(p);
         cs.put(client.getSession(), client);
@@ -135,7 +147,13 @@ public abstract class Room {
 
         // 发送当前用户数
         String content = String.valueOf(players.size());
-        p.sendRoomMessageSync(CaseMessageType.NOTIFY, "当前用户数：" + content);
+        Set<String> names = new HashSet<>();
+//        p.sendRoomMessageSync(CaseMessageType.NOTIFY, "当前用户数:" + content + ",用户是:" + client.getClientName());
+//        broadcastRoomMessage(CaseMessageType.NOTIFY, "当前用户数:" + content + ",用户是:" + client.getClientName());
+        for (Client c : cs.values()) {
+            names.add(c.getClientName());
+        }
+        broadcastRoomMessage(CaseMessageType.NOTIFY, "当前用户数:" + content + ",用户是:" + String.join(",", names));
 
         return p;
     }
@@ -169,15 +187,79 @@ public abstract class Room {
         }
     }
 
+    private void internalHandleEditInst(String msg) {
+        LOGGER.info("接收到来自客户端信息:" + msg);
+        int msgCodeIndex = msg.indexOf('|');
+        String msgCode = msg.substring(0, msgCodeIndex);
+        String msgBack = msg.substring(msgCodeIndex + 1);
+        int nodeIdIndex = msgBack.indexOf('|');
+        String nodeId = msgBack.substring(0, nodeIdIndex);
+        String content = msgBack.substring(nodeIdIndex + 1);
+        String caseContent = (testCaseContent==null?testCase.getCaseContent():testCaseContent);
+        ArrayNode patch = FACTORY.arrayNode();
+
+        switch (msgCode) {
+
+            case "pariwise" :
+                LOGGER.info("用户输入：" + content);
+                List<String> pairWiseCases = PairWise.solution(content);
+                if (pairWiseCases.size() == 0) {
+                    LOGGER.error("未生成用例。");
+                    break;
+                }
+                
+                LOGGER.info("生成case：" + pairWiseCases);
+                LOGGER.info("nodeid：" + nodeId);
+
+                patch = JsonNodeOp.generatePatch(caseContent, nodeId, pairWiseCases);
+
+                break;
+            default:
+                break;
+        }
+
+        try {
+            if (patch.size() == 0) {
+                return;
+            }
+            LOGGER.info("发送的patch：" + patch.toString());
+            JsonNode target = JsonPatch.apply(patch, jsonMapper.readTree(caseContent));
+            testCaseContent = target.toString();
+            leavebroadcastMessageForHttp(patch.toString());
+        } catch (Exception e) {
+            LOGGER.error("服务端合并patch异常：", e);
+        }
+
+    }
+
     private void internalHandleMessage(Player p, String msg,
-                                           long msgId) {
+                                       long msgId) {
         p.setLastReceivedMessageId(msgId);
+
+        if (editInfoSaveToDB) {
+            CaseBackup caseBackup = new CaseBackup();
+            caseBackup.setCaseContent(msg);
+            caseBackup.setCaseId(p.getRoom().roomId);
+            caseBackup.setTitle("edit from session: " + p.getClient().getSession().getId());
+            caseBackup.setCreator(p.getClient().getClientName());
+            caseBackup.setIsDelete(2); // 对编辑信息的内容进行特殊标记
+            caseBackup.setRecordContent("");
+            int ret = caseBackupService.insertEditInfo(caseBackup);
+            if (ret < 1) {
+                LOGGER.error("编辑过程备份落库失败. casebackup id: " + caseBackup.getCaseId() + ", case content: " +
+                        caseBackup.getCaseContent());
+            }
+        } else {
+            LOGGER.info(Thread.currentThread().getName() + ": 收到消息... onMessage: " + msg.trim());
+        }
 
         //todo: testCase.apply(msg) 新增如上的方法.
         if (msg.endsWith("undo")) {
             undo();
+            lastUndoCounts ++;
         } else if (msg.endsWith("redo")) {
             redo();
+            lastUndoCounts --;
         } else {
             broadcastMessage(msg);
         }
@@ -185,32 +267,43 @@ public abstract class Room {
 
     private void undo() {
         roomLock.lock();
-        undoPosition --;
-        redoPosition --;
-        broadcastRoomMessage(CaseMessageType.EDITOR, undoDiffs.get(undoPosition));
-        try {
-            JsonNode target = JsonPatch.apply(jsonMapper.readTree(undoDiffs.get(undoPosition)), jsonMapper.readTree(testCaseContent));
-            testCaseContent = target.toString();
-        } catch (Exception e) {
-            roomLock.unlock();
-            LOGGER.error("undo json parse error。", e);
+        if(undoPosition == 0)
+            LOGGER.error("不能再进行undoPosition操作");
+        else{
+            try {
+                undoPosition --;
+                redoPosition --;
+                broadcastRoomMessage(CaseMessageType.EDITOR, undoDiffs.get(undoPosition));
+                JsonNode target = JsonPatch.apply(jsonMapper.readTree(undoDiffs.get(undoPosition)), jsonMapper.readTree(testCaseContent));
+                testCaseContent = target.toString();
+            } catch (Exception e) {
+                roomLock.unlock();
+                LOGGER.error("undo json parse error。", e);
+                return;
+            }
         }
         roomLock.unlock();
     }
 
     private void redo() {
         roomLock.lock();
-        broadcastRoomMessage(CaseMessageType.EDITOR, redoDiffs.get(redoPosition));
-        try {
-            JsonNode target = JsonPatch.apply(jsonMapper.readTree(redoDiffs.get(undoPosition)), jsonMapper.readTree(testCaseContent));
-            testCaseContent = target.toString();
-        } catch (Exception e) {
-            roomLock.unlock();
-            LOGGER.error("redo json parse error。", e);
+        if(redoPosition == undoDiffs.size())
+            LOGGER.error("不能再进行redoPosition操作");
+        else{
+            try {
+                broadcastRoomMessage(CaseMessageType.EDITOR, redoDiffs.get(redoPosition));
+                JsonNode target = JsonPatch.apply(jsonMapper.readTree(redoDiffs.get(undoPosition)), jsonMapper.readTree(testCaseContent));
+                testCaseContent = target.toString();
+            } catch (Exception e) {
+                roomLock.unlock();
+                LOGGER.error("redo json parse error。", e);
+                return;
+            }
+
+            undoPosition ++;
+            redoPosition ++;
         }
 
-        undoPosition ++;
-        redoPosition ++;
         roomLock.unlock();
     }
 
@@ -226,6 +319,12 @@ public abstract class Room {
                 p.getBufferedMessages().add("2" + msg.substring(seperateIndex + 1));
 //                p.sendRoomMessage("2" + "lock");
             }
+        }
+    }
+
+    public void leavebroadcastMessageForHttp(String msg) {
+        for (Player p : players) {
+                p.getClient().sendMessage(CaseMessageType.EDITOR, msg);
         }
     }
 
@@ -380,7 +479,7 @@ public abstract class Room {
 
         private Integer pingCount;
 
-//        private Integer undoPosition;
+        //        private Integer undoPosition;
 //        private Integer redoPosition;
         private Integer undoCount;
         private Integer redoCount;
@@ -475,6 +574,10 @@ public abstract class Room {
          */
         public void handleMessage(String msg, long msgId) {
             room.internalHandleMessage(this, msg, msgId);
+        }
+
+        public void handleEditInst(String msg) {
+            room.internalHandleEditInst(msg);
         }
 
         public void handleCtrlMessage(String msg) {
